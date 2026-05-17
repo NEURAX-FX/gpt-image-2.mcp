@@ -23,7 +23,7 @@ Converted from [wuyoscar/gpt_image_2_skill](https://github.com/wuyoscar/gpt_imag
 ### Prerequisites
 
 - Node.js ≥ 18
-- OpenAI API key with GPT Image 2 access
+- Optional: OpenAI API key with GPT Image 2 access. With a key, the server calls OpenAI and returns MCP image content directly by default. Without a key, image tools return a machine-readable `image_model_handoff` JSON payload for the MCP host to forward to an actual image generation/editing model.
 
 ### Install via npm
 
@@ -43,7 +43,7 @@ npm link  # optional: make globally available
 
 ## Configuration
 
-Set your OpenAI API key via environment variable, `.env`, or `~/.env`:
+To let the MCP server call OpenAI directly, set your OpenAI API key via environment variable, `.env`, or `~/.env`:
 
 ```bash
 export OPENAI_API_KEY=sk-...
@@ -57,6 +57,18 @@ cp .env.example .env
 ```
 
 The server reads `OPENAI_API_KEY` from process env first, then `./.env`, then `~/.env` (without overriding existing env).
+
+If `OPENAI_API_KEY` is not set, `generate_image` and `edit_image` do not ask the chat model to produce a final text answer. Instead, they return structured JSON with `type: "image_model_handoff"`, the refined image prompt, reference image paths for edits, and image parameters. The MCP host should use the chat model only to refine/route that payload, then forward it to a real image generation or image editing model.
+
+Optional logging configuration:
+
+```bash
+LOG_LEVEL=debug   # default: verbose structured stderr logs
+LOG_LEVEL=info    # startup, success, and error logs only
+LOG_LEVEL=silent  # suppress logs except process-level failures
+```
+
+Logs are written to stderr so stdio MCP transport remains valid. Tool logs include event names, timing, mode (`openai` or `handoff`), output counts, and argument summaries. Full prompts, image payloads, API keys, tokens, and secrets are not logged.
 
 ## Usage
 
@@ -110,26 +122,46 @@ Run as a local HTTP MCP server when your client supports MCP over SSE:
 MCP_TRANSPORT=http node dist/index.js
 ```
 
-Defaults: `http://127.0.0.1:3333/sse`. Override with `MCP_HOST` and `MCP_PORT`:
+Defaults: `http://127.0.0.1:3333`. Override with `MCP_HOST` and `MCP_PORT`:
 
 ```bash
 MCP_TRANSPORT=http MCP_HOST=0.0.0.0 MCP_PORT=8080 node dist/index.js
 ```
 
 HTTP endpoints:
-- `GET /sse` — MCP SSE connection endpoint
-- `POST /message?sessionId=...` — JSON-RPC message endpoint advertised by SSE
+- `GET /` — MCP Streamable HTTP endpoint (supports SSE streaming for server-initiated messages)
+- `POST /` — MCP Streamable HTTP endpoint (JSON-RPC request/response)
 - `GET /health` — local health check
+
+### Direct Curl Script
+
+For isolating API/provider behavior outside MCP, use the bundled executable script:
+
+```bash
+npm run image:curl
+```
+
+It reads `OPENAI_BASE_URL` and `OPENAI_API_KEY` from `/etc/gpt-image-mcp.env` by default, sends a raw `curl` request to `/images/generations`, prints the JSON response, and saves the first returned image to `fig/curl-test-image.png`.
+
+Useful variants:
+
+```bash
+scripts/generate-image-curl.sh --mode json
+scripts/generate-image-curl.sh --mode image --output fig/apple.png
+scripts/generate-image-curl.sh --prompt "A studio photo of a red apple" --quality low
+scripts/generate-image-curl.sh --env-file .env --mode both
+```
 
 ## Tools
 
 ### `generate_image`
 
-Text-to-image generation.
+Text-to-image generation. With `OPENAI_API_KEY`, this calls OpenAI and returns MCP image content by default. Without `OPENAI_API_KEY`, this returns an `image_model_handoff` JSON payload intended for a downstream image generation model, not for text-only chat completion.
 
 **Parameters**:
 - `prompt` (required): Text prompt
-- `file`: Output path (auto-generated if omitted)
+- `return`: `image` | `file` | `both`. Default is `image`; if `file` is supplied and `return` is omitted, default becomes `file`.
+- `file`: Output path for `file` or `both` return modes. Auto-generated if file output is requested and omitted.
 - `model`: Model ID (default `gpt-image-2`)
 - `size`: Canvas size — literal (`1024x1024`, `1536x1024`, `2048x2048`, `3840x2160`) or shortcut (`1k`, `2k`, `4k`, `portrait`, `landscape`, `square`, `wide`, `tall`)
 - `quality`: `low` | `medium` | `high` | `auto` (default `high`)
@@ -151,13 +183,14 @@ Text-to-image generation.
 
 ### `edit_image`
 
-Reference-image editing and inpainting.
+Reference-image editing and inpainting. With `OPENAI_API_KEY`, this calls OpenAI and returns MCP image content by default. Without `OPENAI_API_KEY`, this returns an `image_model_handoff` JSON payload with reference image paths for a downstream image editing model.
 
 **Parameters**:
 - `prompt` (required): Edit instruction
 - `image` (required): Array of reference image paths
 - `mask`: Alpha-channel PNG mask path (opaque=keep, transparent=regenerate)
-- `file`: Output path
+- `return`: `image` | `file` | `both`. Default is `image`; if `file` is supplied and `return` is omitted, default becomes `file`.
+- `file`: Output path for `file` or `both` return modes
 - `model`, `size`, `quality`, `n`, `background`, `format`, `compression`, `user`: Same as `generate_image`
 - `input_fidelity`: `low` | `high` (auto-dropped for gpt-image-2)
 

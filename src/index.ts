@@ -11,7 +11,8 @@
  */
 import { Server } from "@modelcontextprotocol/sdk/server/index.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
-import { SSEServerTransport } from "@modelcontextprotocol/sdk/server/sse.js";
+import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
+import { randomUUID } from "crypto";
 import {
   CallToolRequestSchema,
   ListToolsRequestSchema,
@@ -28,6 +29,8 @@ import path from "path";
 import os from "os";
 import http from "http";
 import { fileURLToPath } from "url";
+import { buildImageToolContent, mimeTypeForFormat, resolveImageReturnMode, type ImageResultItem, type ImageReturnMode } from "./image-result.js";
+import { createLogger, errorSummary, summarizeToolArgs } from "./logger.js";
 import { parseRuntimeConfig } from "./runtime-config.js";
 
 const __filename = fileURLToPath(import.meta.url);
@@ -54,6 +57,7 @@ const SIZE_SHORTCUTS: Record<string, string> = {
 const DEFAULT_MODEL = "gpt-image-2";
 const DEFAULT_SIZE = "1024x1024";
 const DEFAULT_MODERATION = "low";
+const logger = createLogger();
 
 function resolveSize(value: string): string {
   return SIZE_SHORTCUTS[value.toLowerCase()] ?? value;
@@ -106,6 +110,7 @@ interface GenerateArgs {
   format?: "png" | "jpeg" | "webp";
   compression?: number;
   user?: string;
+  return?: ImageReturnMode;
 }
 
 interface EditArgs extends GenerateArgs {
@@ -114,12 +119,45 @@ interface EditArgs extends GenerateArgs {
   input_fidelity?: "low" | "high";
 }
 
+function imageHandoffPayload(
+  operation: "generate" | "edit",
+  args: GenerateArgs | EditArgs,
+): Record<string, unknown> {
+  const payload: Record<string, unknown> = {
+    type: "image_model_handoff",
+    operation,
+    target_model_class: operation === "generate" ? "image_generation" : "image_editing",
+    instructions:
+      "Use the chat model only to refine the prompt if needed, then forward this payload to an actual image generation/editing model. Do not answer with text-only chat output.",
+    prompt: args.prompt,
+    parameters: filterUndefined({
+      size: resolveSize(args.size ?? DEFAULT_SIZE),
+      quality: args.quality ?? "high",
+      n: args.n ?? 1,
+      background: args.background,
+      format: args.format ?? "png",
+      compression: args.compression,
+      user: args.user,
+    }),
+  };
+
+  if (operation === "edit") {
+    const editArgs = args as EditArgs;
+    payload.reference_images = editArgs.image;
+    if (editArgs.mask) payload.mask = editArgs.mask;
+  }
+
+  return payload;
+}
+
 async function writeOutputs(
   data: Array<{ b64_json?: string | null; url?: string | null }>,
   outPath: string,
   n: number,
 ): Promise<string[]> {
   await fs.mkdir(path.dirname(outPath), { recursive: true });
+  const started = Date.now();
+  logger.debug("files.write.start", { outputPath: outPath, imageCount: data.length, n });
   const written: string[] = [];
   for (let i = 0; i < data.length; i++) {
     const item = data[i];
@@ -144,17 +182,47 @@ async function writeOutputs(
     await fs.writeFile(target, raw);
     written.push(target);
   }
+  logger.debug("files.write.success", { outputs: written, durationMs: Date.now() - started });
   return written;
+}
+
+async function imageDataFromResponseItem(
+  item: { b64_json?: string | null; url?: string | null },
+  index: number,
+): Promise<string> {
+  if (item.b64_json) return item.b64_json;
+  if (item.url) {
+    const res = await fetch(item.url);
+    if (!res.ok) throw new Error(`failed to fetch result url: ${res.status}`);
+    return Buffer.from(await res.arrayBuffer()).toString("base64");
+  }
+  throw new Error(`response item ${index} has neither b64_json nor url`);
+}
+
+async function buildApiImageResult(
+  data: Array<{ b64_json?: string | null; url?: string | null }>,
+  args: GenerateArgs,
+  outPath: string,
+): Promise<{ images: ImageResultItem[]; paths: string[]; returnMode: ImageReturnMode }> {
+  const returnMode = resolveImageReturnMode(args);
+  const mimeType = mimeTypeForFormat(args.format);
+  const b64Images = await Promise.all(data.map((item, i) => imageDataFromResponseItem(item, i)));
+  const images = returnMode === "file" ? [] : b64Images.map((b64) => ({ data: b64, mimeType }));
+  const paths = returnMode === "image"
+    ? []
+    : await writeOutputs(b64Images.map((b64_json) => ({ b64_json })), outPath, args.n ?? 1);
+
+  return { images, paths, returnMode };
 }
 
 function getClient(): OpenAI | null {
   if (!process.env.OPENAI_API_KEY) {
     return null;
   }
-  return new OpenAI();
+  return new OpenAI({ baseURL: process.env.OPENAI_BASE_URL });
 }
 
-async function runGenerate(args: GenerateArgs, server?: Server): Promise<string[] | { usedSampling: true; prompt: string }> {
+async function runGenerate(args: GenerateArgs, server?: Server): Promise<{ images: ImageResultItem[]; paths: string[]; returnMode: ImageReturnMode } | { usedSampling: true; prompt: string }> {
   const client = getClient();
   
   // Mode 1: Use OpenAI API if key is available
@@ -177,12 +245,23 @@ async function runGenerate(args: GenerateArgs, server?: Server): Promise<string[
       user: args.user,
     });
 
+    logger.debug("tool.api.request", {
+      tool: "generate_image",
+      mode: "openai",
+      model: params.model,
+      size: params.size,
+      quality: params.quality,
+      n: params.n,
+      outputFormat: params.output_format ?? "png",
+      baseURL: process.env.OPENAI_BASE_URL ? "custom" : "default",
+    });
+
     const result = await client.images.generate(params as any);
     const data = result.data ?? [];
     if (data.length === 0) {
       throw new Error("no image data in response");
     }
-    return writeOutputs(data, outPath, args.n ?? 1);
+    return buildApiImageResult(data, args, outPath);
   }
   
   // Mode 2: Use sampling to request client-side image generation
@@ -190,10 +269,11 @@ async function runGenerate(args: GenerateArgs, server?: Server): Promise<string[
     throw new Error("No OPENAI_API_KEY and no server instance for sampling");
   }
   
+  logger.debug("tool.handoff", { tool: "generate_image", mode: "handoff", promptChars: args.prompt.length });
   return { usedSampling: true, prompt: args.prompt };
 }
 
-async function runEdit(args: EditArgs, server?: Server): Promise<string[] | { usedSampling: true; prompt: string }> {
+async function runEdit(args: EditArgs, server?: Server): Promise<{ images: ImageResultItem[]; paths: string[]; returnMode: ImageReturnMode; note?: string } | { usedSampling: true; prompt: string }> {
   const client = getClient();
   
   // Without an API key we can't read remote refs anyway; return sampling sentinel
@@ -201,6 +281,7 @@ async function runEdit(args: EditArgs, server?: Server): Promise<string[] | { us
     if (!server) {
       throw new Error("No OPENAI_API_KEY and no server instance for sampling");
     }
+    logger.debug("tool.handoff", { tool: "edit_image", mode: "handoff", promptChars: args.prompt.length, imageCount: args.image.length, hasMask: Boolean(args.mask) });
     return { usedSampling: true, prompt: args.prompt };
   }
   
@@ -252,17 +333,29 @@ async function runEdit(args: EditArgs, server?: Server): Promise<string[] | { us
     user: args.user,
   });
 
+  logger.debug("tool.api.request", {
+    tool: "edit_image",
+    mode: "openai",
+    model: params.model,
+    size: params.size,
+    quality: params.quality,
+    n: params.n,
+    outputFormat: params.output_format ?? "png",
+    imageCount: args.image.length,
+    hasMask: Boolean(args.mask),
+    baseURL: process.env.OPENAI_BASE_URL ? "custom" : "default",
+  });
+
   const result = await client.images.edit(params as any);
   const data = result.data ?? [];
   if (data.length === 0) {
     throw new Error("no image data in response");
   }
-  const written = await writeOutputs(data, outPath, args.n ?? 1);
-  if (noteParts.length) {
-    // attach note via a sibling sentinel; surfaced by caller
-    (written as any)._note = noteParts.join("\n");
-  }
-  return written;
+  const imageResult = await buildApiImageResult(data, args, outPath);
+  return {
+    ...imageResult,
+    note: noteParts.length ? noteParts.join("\n") : undefined,
+  };
 }
 
 function createMcpServer(): Server {
@@ -289,7 +382,13 @@ const COMMON_PROPS = {
   file: {
     type: "string",
     description:
-      "Output file path. Auto-named (./fig/ or ./) using a timestamp + slug if omitted.",
+      "Output file path. Supplying this defaults `return` to `file`. Auto-named (./fig/ or ./) using a timestamp + slug when file output is requested and omitted.",
+  },
+  return: {
+    type: "string",
+    enum: ["image", "file", "both"],
+    description:
+      "How to return API-generated images. Default `image` returns MCP image content directly. Supplying `file` without `return` defaults to `file`. `both` returns file path text plus image content.",
   },
   model: {
     type: "string",
@@ -414,62 +513,50 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
 
 server.setRequestHandler(CallToolRequestSchema, async (request) => {
   const { name, arguments: args } = request.params;
+  const started = Date.now();
+  logger.debug("tool.start", summarizeToolArgs(name, args as Record<string, unknown> | undefined));
   try {
     if (name === "generate_image") {
       const result = await runGenerate(args as unknown as GenerateArgs, server);
-      if (Array.isArray(result)) {
+      if (!("usedSampling" in result)) {
+        logger.info("tool.success", { tool: name, mode: "openai", returnMode: result.returnMode, durationMs: Date.now() - started, outputs: result.images.length || result.paths.length });
         return {
-          content: [
-            {
-              type: "text",
-              text: `Generated ${result.length} image(s) via OpenAI API:\n${result.join("\n")}`,
-            },
-          ],
+          content: buildImageToolContent({ operation: "generate", ...result }),
         };
       }
-      // Sampling fallback: return optimized prompt for the host LLM to render with its own image tool
       const a = args as unknown as GenerateArgs;
-      const meta = [
-        `size: ${resolveSize(a.size ?? DEFAULT_SIZE)}`,
-        `quality: ${a.quality ?? "high"}`,
-        a.n && a.n > 1 ? `n: ${a.n}` : null,
-        a.background ? `background: ${a.background}` : null,
-        a.format ? `format: ${a.format}` : null,
-      ].filter(Boolean).join(", ");
+      logger.info("tool.success", { tool: name, mode: "handoff", durationMs: Date.now() - started });
       return {
         content: [
           {
             type: "text",
-            text: `No OPENAI_API_KEY configured on the MCP server. Please render the following image with your client-side image generation tool:\n\nPROMPT:\n${result.prompt}\n\nPARAMETERS: ${meta}`,
+            text: JSON.stringify(imageHandoffPayload("generate", a), null, 2),
           },
         ],
       };
     }
     if (name === "edit_image") {
       const result = await runEdit(args as unknown as EditArgs, server);
-      if (Array.isArray(result)) {
-        const note = (result as any)._note as string | undefined;
+      if (!("usedSampling" in result)) {
+        logger.info("tool.success", { tool: name, mode: "openai", returnMode: result.returnMode, durationMs: Date.now() - started, outputs: result.images.length || result.paths.length });
         return {
-          content: [
-            {
-              type: "text",
-              text: `${note ? note + "\n" : ""}Wrote ${result.length} image(s) via OpenAI API:\n${result.join("\n")}`,
-            },
-          ],
+          content: buildImageToolContent({ operation: "edit", ...result }),
         };
       }
       const a = args as unknown as EditArgs;
+      logger.info("tool.success", { tool: name, mode: "handoff", durationMs: Date.now() - started });
       return {
         content: [
           {
             type: "text",
-            text: `No OPENAI_API_KEY configured on the MCP server. Please render the following edit with your client-side image tool, using the supplied reference images (${a.image.join(", ")}):\n\nPROMPT:\n${result.prompt}`,
+            text: JSON.stringify(imageHandoffPayload("edit", a), null, 2),
           },
         ],
       };
     }
     if (name === "list_gallery_categories") {
       const files = listReferenceFiles();
+      logger.info("tool.success", { tool: name, durationMs: Date.now() - started, files: files.length });
       return {
         content: [
           {
@@ -491,11 +578,13 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         throw new Error(`reference not found: ${fname}`);
       }
       const text = readFileSync(target, "utf8");
+      logger.info("tool.success", { tool: name, durationMs: Date.now() - started, name: fname, chars: text.length });
       return { content: [{ type: "text", text }] };
     }
     throw new Error(`unknown tool: ${name}`);
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);
+    logger.error("tool.error", { tool: name, durationMs: Date.now() - started, ...errorSummary(err) });
     return {
       isError: true,
       content: [{ type: "text", text: `error: ${msg}` }],
@@ -600,42 +689,32 @@ Size policy: square=1k, portrait poster, landscape gameplay, 2k print, 4k widesc
 }
 
 async function startHttpServer(host: string, port: number): Promise<void> {
-  const sessions = new Map<string, SSEServerTransport>();
+  const transport = new StreamableHTTPServerTransport({
+    sessionIdGenerator: () => randomUUID(),
+  });
+
+  const server = createMcpServer();
+  await server.connect(transport);
 
   const httpServer = http.createServer(async (req, res) => {
     try {
       const url = new URL(req.url ?? "/", `http://${req.headers.host ?? `${host}:${port}`}`);
+      const started = Date.now();
+      logger.debug("http.request", { method: req.method, path: url.pathname });
 
       if (req.method === "GET" && url.pathname === "/health") {
         res.writeHead(200, { "content-type": "application/json" });
-        res.end(JSON.stringify({ ok: true, transport: "http-sse" }));
+        res.end(JSON.stringify({ ok: true, transport: "streamable-http" }));
+        logger.debug("http.response", { method: req.method, path: url.pathname, status: 200, durationMs: Date.now() - started });
         return;
       }
 
-      if (req.method === "GET" && url.pathname === "/sse") {
-        const transport = new SSEServerTransport("/message", res);
-        sessions.set(transport.sessionId, transport);
-        transport.onclose = () => sessions.delete(transport.sessionId);
-        transport.onerror = (error) => console.error("sse transport error:", error);
-        await createMcpServer().connect(transport);
-        return;
-      }
-
-      if (req.method === "POST" && url.pathname === "/message") {
-        const sessionId = url.searchParams.get("sessionId");
-        const transport = sessionId ? sessions.get(sessionId) : undefined;
-        if (!transport) {
-          res.writeHead(404).end("Unknown or missing sessionId");
-          return;
-        }
-        await transport.handlePostMessage(req, res);
-        return;
-      }
-
-      res.writeHead(404).end("Not found. Use GET /sse for MCP over SSE, POST /message?sessionId=..., or GET /health.");
+      // Delegate all MCP requests to the StreamableHTTPServerTransport
+      await transport.handleRequest(req, res);
+      logger.debug("http.response", { method: req.method, path: url.pathname, status: res.statusCode, durationMs: Date.now() - started });
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
-      console.error("http transport error:", err);
+      logger.error("http.error", errorSummary(err));
       if (!res.headersSent) res.writeHead(500);
       res.end(msg);
     }
@@ -646,7 +725,7 @@ async function startHttpServer(host: string, port: number): Promise<void> {
     httpServer.listen(port, host, () => resolve());
   });
 
-  console.error(`gpt-image-2-mcp server ready (http+sse http://${host}:${port}/sse)`);
+  logger.info("server.ready", { transport: "streamable-http", url: `http://${host}:${port}` });
 }
 
 // ---- main ----
@@ -659,10 +738,10 @@ async function main() {
 
   const transport = new StdioServerTransport();
   await createMcpServer().connect(transport);
-  console.error("gpt-image-2-mcp server ready (stdio)");
+  logger.info("server.ready", { transport: "stdio" });
 }
 
 main().catch((err) => {
-  console.error("fatal:", err);
+  logger.error("fatal", errorSummary(err));
   process.exit(1);
 });

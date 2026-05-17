@@ -15,12 +15,26 @@ npm install
 
 ## Configuration
 
-Create a `.env` file with your OpenAI API key:
+Optional: create a `.env` file with your OpenAI API key if you want this MCP server to call OpenAI directly:
 
 ```bash
 cp .env.example .env
 # Edit .env and add: OPENAI_API_KEY=sk-...
 ```
+
+Without `OPENAI_API_KEY`, image tools return a machine-readable `image_model_handoff` JSON payload. Your MCP host should let the chat model refine/route the prompt, then forward the payload to an actual image generation or image editing model.
+
+With `OPENAI_API_KEY`, generated images are returned as MCP `image` content by default. Use `return: "file"` or pass `file` if you want images written to disk instead; use `return: "both"` to get file paths plus inline image content.
+
+Logging is controlled with `LOG_LEVEL`:
+
+```bash
+LOG_LEVEL=debug   # default, verbose structured stderr logs
+LOG_LEVEL=info    # startup, success, and error logs only
+LOG_LEVEL=silent  # suppress routine logs
+```
+
+Logs are safe for stdio transport because they go to stderr. Full prompts and secrets are not logged.
 
 ## Test the Server
 
@@ -37,10 +51,26 @@ For local HTTP/SSE clients:
 MCP_TRANSPORT=http node dist/index.js
 ```
 
-The default HTTP endpoint is `http://127.0.0.1:3333/sse`. Override it with `MCP_HOST` and `MCP_PORT`:
+The default HTTP endpoint is `http://127.0.0.1:3333`. Override it with `MCP_HOST` and `MCP_PORT`:
 
 ```bash
 MCP_TRANSPORT=http MCP_HOST=0.0.0.0 MCP_PORT=8080 node dist/index.js
+```
+
+## Test the Provider Directly
+
+Use the executable curl script to bypass MCP and call `/images/generations` directly:
+
+```bash
+npm run image:curl
+```
+
+By default it reads `/etc/gpt-image-mcp.env`, prints the raw JSON response, and saves the first image to `fig/curl-test-image.png`.
+
+```bash
+scripts/generate-image-curl.sh --mode json
+scripts/generate-image-curl.sh --mode image --output fig/apple.png
+scripts/generate-image-curl.sh --prompt "A studio photo of a red apple" --quality low
 ```
 
 ## Use with Claude Desktop
@@ -90,9 +120,9 @@ All reference markdown files are exposed as MCP resources:
 
 ## Troubleshooting
 
-**"OPENAI_API_KEY not set"**
-- Ensure your `.env` file exists and contains the key
-- Or set it in the MCP server config's `env` section
+**No image file appears**
+- If `OPENAI_API_KEY` is set, this is expected by default: the tool returns MCP image content. Use `return: "file"` or `file` to write to disk.
+- If `OPENAI_API_KEY` is not set, this is expected: the tool returns `image_model_handoff` JSON for your MCP host to forward to an image model.
 
 **"command not found: node"**
 - Install Node.js ≥ 18 from https://nodejs.org
