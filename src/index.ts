@@ -147,45 +147,63 @@ async function writeOutputs(
   return written;
 }
 
-function getClient(): OpenAI {
+function getClient(): OpenAI | null {
   if (!process.env.OPENAI_API_KEY) {
-    throw new Error(
-      "OPENAI_API_KEY not set. Add it to env / .env / ~/.env before invoking image tools.",
-    );
+    return null;
   }
   return new OpenAI();
 }
 
-async function runGenerate(args: GenerateArgs): Promise<string[]> {
+async function runGenerate(args: GenerateArgs, server?: Server): Promise<string[] | { usedSampling: true; prompt: string }> {
   const client = getClient();
-  const ext = args.format ?? "png";
-  const outPath = args.file
-    ? path.resolve(args.file.replace(/^~/, os.homedir()))
-    : defaultOutputPath(args.prompt, ext);
+  
+  // Mode 1: Use OpenAI API if key is available
+  if (client) {
+    const ext = args.format ?? "png";
+    const outPath = args.file
+      ? path.resolve(args.file.replace(/^~/, os.homedir()))
+      : defaultOutputPath(args.prompt, ext);
 
-  const params = filterUndefined({
-    model: args.model ?? DEFAULT_MODEL,
-    prompt: args.prompt,
-    size: resolveSize(args.size ?? DEFAULT_SIZE),
-    quality: args.quality ?? "high",
-    n: args.n ?? 1,
-    background: args.background,
-    moderation: args.moderation ?? DEFAULT_MODERATION,
-    output_format: args.format,
-    output_compression: args.compression,
-    user: args.user,
-  });
+    const params = filterUndefined({
+      model: args.model ?? DEFAULT_MODEL,
+      prompt: args.prompt,
+      size: resolveSize(args.size ?? DEFAULT_SIZE),
+      quality: args.quality ?? "high",
+      n: args.n ?? 1,
+      background: args.background,
+      moderation: args.moderation ?? DEFAULT_MODERATION,
+      output_format: args.format,
+      output_compression: args.compression,
+      user: args.user,
+    });
 
-  const result = await client.images.generate(params as any);
-  const data = result.data ?? [];
-  if (data.length === 0) {
-    throw new Error("no image data in response");
+    const result = await client.images.generate(params as any);
+    const data = result.data ?? [];
+    if (data.length === 0) {
+      throw new Error("no image data in response");
+    }
+    return writeOutputs(data, outPath, args.n ?? 1);
   }
-  return writeOutputs(data, outPath, args.n ?? 1);
+  
+  // Mode 2: Use sampling to request client-side image generation
+  if (!server) {
+    throw new Error("No OPENAI_API_KEY and no server instance for sampling");
+  }
+  
+  return { usedSampling: true, prompt: args.prompt };
 }
 
-async function runEdit(args: EditArgs): Promise<string[]> {
+async function runEdit(args: EditArgs, server?: Server): Promise<string[] | { usedSampling: true; prompt: string }> {
   const client = getClient();
+  
+  // Without an API key we can't read remote refs anyway; return sampling sentinel
+  if (!client) {
+    if (!server) {
+      throw new Error("No OPENAI_API_KEY and no server instance for sampling");
+    }
+    return { usedSampling: true, prompt: args.prompt };
+  }
+  
   const ext = args.format ?? "png";
   const outPath = args.file
     ? path.resolve(args.file.replace(/^~/, os.homedir()))
@@ -324,7 +342,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
     {
       name: "generate_image",
       description:
-        "Text-to-image via OpenAI GPT Image 2 (/v1/images/generations). Use for fresh creations: posters, illustrations, UI mockups, diagrams, typography, photography. Returns paths of written image files.",
+        "Text-to-image via OpenAI GPT Image 2 (/v1/images/generations) or client-side image generation. If OPENAI_API_KEY is configured, generates and saves images directly. Otherwise, returns an optimized prompt for the client to render with its own image tool. Use for fresh creations: posters, illustrations, UI mockups, diagrams, typography, photography.",
       inputSchema: {
         type: "object",
         properties: {
@@ -342,7 +360,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
     {
       name: "edit_image",
       description:
-        "Reference-image edit / inpaint via GPT Image 2 (/v1/images/edits). Provide one or more reference images via `image`. Optional alpha-channel `mask` PNG marks regions to regenerate (opaque=keep, transparent=regenerate). Use for colorization, restyle, multi-reference composition, outfit transfer, inpainting, text translation in image.",
+        "Reference-image edit / inpaint via GPT Image 2 (/v1/images/edits) or client-side editing. If OPENAI_API_KEY is configured, edits via API. Otherwise, returns an optimized edit instruction for the client to apply with its own image tool. Provide one or more reference images via `image`. Optional alpha-channel `mask` PNG marks regions to regenerate (opaque=keep, transparent=regenerate). Use for colorization, restyle, multi-reference composition, outfit transfer, inpainting, text translation in image.",
       inputSchema: {
         type: "object",
         properties: {
@@ -398,24 +416,54 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
   const { name, arguments: args } = request.params;
   try {
     if (name === "generate_image") {
-      const written = await runGenerate(args as unknown as GenerateArgs);
+      const result = await runGenerate(args as unknown as GenerateArgs, server);
+      if (Array.isArray(result)) {
+        return {
+          content: [
+            {
+              type: "text",
+              text: `Generated ${result.length} image(s) via OpenAI API:\n${result.join("\n")}`,
+            },
+          ],
+        };
+      }
+      // Sampling fallback: return optimized prompt for the host LLM to render with its own image tool
+      const a = args as unknown as GenerateArgs;
+      const meta = [
+        `size: ${resolveSize(a.size ?? DEFAULT_SIZE)}`,
+        `quality: ${a.quality ?? "high"}`,
+        a.n && a.n > 1 ? `n: ${a.n}` : null,
+        a.background ? `background: ${a.background}` : null,
+        a.format ? `format: ${a.format}` : null,
+      ].filter(Boolean).join(", ");
       return {
         content: [
           {
             type: "text",
-            text: `Generated ${written.length} image(s):\n${written.join("\n")}`,
+            text: `No OPENAI_API_KEY configured on the MCP server. Please render the following image with your client-side image generation tool:\n\nPROMPT:\n${result.prompt}\n\nPARAMETERS: ${meta}`,
           },
         ],
       };
     }
     if (name === "edit_image") {
-      const written = await runEdit(args as unknown as EditArgs);
-      const note = (written as any)._note as string | undefined;
+      const result = await runEdit(args as unknown as EditArgs, server);
+      if (Array.isArray(result)) {
+        const note = (result as any)._note as string | undefined;
+        return {
+          content: [
+            {
+              type: "text",
+              text: `${note ? note + "\n" : ""}Wrote ${result.length} image(s) via OpenAI API:\n${result.join("\n")}`,
+            },
+          ],
+        };
+      }
+      const a = args as unknown as EditArgs;
       return {
         content: [
           {
             type: "text",
-            text: `${note ? note + "\n" : ""}Wrote ${written.length} image(s):\n${written.join("\n")}`,
+            text: `No OPENAI_API_KEY configured on the MCP server. Please render the following edit with your client-side image tool, using the supplied reference images (${a.image.join(", ")}):\n\nPROMPT:\n${result.prompt}`,
           },
         ],
       };
