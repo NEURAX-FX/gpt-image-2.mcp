@@ -13,3 +13,4 @@ fig/
 !docs/**/*.png
 !docs/**/*.jpg
 .lcm/
+.lcm.broken.*/
